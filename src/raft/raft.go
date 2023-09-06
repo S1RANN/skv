@@ -650,6 +650,7 @@ func (rf *Raft) sendLogs(i int) {
 		// do nothing, just to identify this situation
 	case PREV_INDEX_IN_SNAPSHOT:
 		rf.nextIndex[i] = rf.nextIndex[rf.me]
+		go rf.sendLogs(i)
 	}
 }
 
