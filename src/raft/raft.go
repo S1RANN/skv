@@ -485,11 +485,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex-rf.offset > len(rf.logs)-1 {
 		reply.Result = LOG_NOT_EXISTS_AT_PREV_INDEX
 		reply.IndexAfterLastLog = len(rf.logs) + rf.offset
+		rf.debug("'s lastLogIndex %v than args.PrevLogIndex %v, rejecting the request",
+			len(rf.logs)-1+rf.offset, args.PrevLogIndex)
 		return
 	}
 
 	if args.PrevLogIndex-rf.offset < 0 {
 		reply.Result = PREV_INDEX_IN_SNAPSHOT
+		rf.debug("'s offset %v > args.PrevLogIndex %v, rejecting the request",
+			rf.offset, args.PrevLogIndex)
 		return
 	}
 
@@ -502,6 +506,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		reply.FirstConflictTermIndex = i
+		rf.debug(" log at %v has term %v, args.PrevLogTerm=%v, rejecting the request",
+			args.PrevLogIndex, rf.logs[args.PrevLogIndex-rf.offset].Term, args.PrevLogTerm)
 		return
 	}
 
@@ -522,18 +528,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.persist()
 
-	rf.debug("commitIndex: %v, logs: %v", rf.commitIndex, rf.logs)
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < len(rf.logs)-1+rf.offset {
 			rf.commitIndex = args.LeaderCommit
 		} else {
 			rf.commitIndex = len(rf.logs) - 1 + rf.offset
 		}
-		rf.debug("'s commitIndex is now %v", rf.commitIndex)
 		rf.applyCond.Broadcast()
 	}
 
 	reply.Result = SUCCESS
+	rf.debug("reply SUCCESS to AppendEntry request, commitIndex=%v, logs=%v",
+		rf.commitIndex, rf.logs)
 }
 
 func (rf *Raft) sendAppendEntries(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -629,7 +635,9 @@ func (rf *Raft) sendLogs(i int) {
 
 		for ; idx-rf.offset > 0 && rf.logs[idx-rf.offset].Term > reply.ConflictTerm; idx-- {
 		}
-		if rf.logs[idx-rf.offset].Term == reply.ConflictTerm {
+		if idx-rf.offset < 0 {
+			// made a new snapshot before receiving response
+		} else if rf.logs[idx-rf.offset].Term == reply.ConflictTerm {
 			rf.nextIndex[i] = idx + 1
 		} else {
 			rf.nextIndex[i] = reply.FirstConflictTermIndex
@@ -641,7 +649,7 @@ func (rf *Raft) sendLogs(i int) {
 	case REQUEST_WITH_LOWER_TERM:
 		// do nothing, just to identify this situation
 	case PREV_INDEX_IN_SNAPSHOT:
-		// do nothing, just to identify this situation
+		rf.nextIndex[i] = rf.nextIndex[rf.me]
 	}
 }
 
