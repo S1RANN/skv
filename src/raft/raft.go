@@ -492,6 +492,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex-rf.offset < 0 {
 		reply.Result = PREV_INDEX_IN_SNAPSHOT
+		reply.IndexAfterLastLog = len(rf.logs) + rf.offset
 		rf.debug("'s offset %v > args.PrevLogIndex %v, rejecting the request",
 			rf.offset, args.PrevLogIndex)
 		return
@@ -649,7 +650,7 @@ func (rf *Raft) sendLogs(i int) {
 	case REQUEST_WITH_LOWER_TERM:
 		// do nothing, just to identify this situation
 	case PREV_INDEX_IN_SNAPSHOT:
-		rf.nextIndex[i] = rf.nextIndex[rf.me]
+		rf.nextIndex[i] = reply.IndexAfterLastLog
 		go rf.sendLogs(i)
 	}
 }
