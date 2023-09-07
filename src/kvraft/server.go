@@ -12,7 +12,7 @@ import (
 	"6.5840/raft"
 )
 
-const Debug = true
+const Debug = false
 const INFO = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
