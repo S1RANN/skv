@@ -554,7 +554,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	if oldWaker != nil {
 		sc.debug("waking up the old rpc for %v:%v", args.ClientId, oldWaker.seq)
-		oldWaker.done <- true
+		oldWaker.done <- Config{}
 		sc.debug("woke up the old rpc %v:%v", args.ClientId, oldWaker.seq)
 	}
 
