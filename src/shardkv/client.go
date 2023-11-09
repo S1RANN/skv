@@ -10,12 +10,21 @@ package shardkv
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
 	"time"
 
 	"6.5840/labrpc"
 	"6.5840/shardctrler"
 )
+
+func (ck *Clerk) debug(format string, a ...interface{}) (n int, err error) {
+	if DEBUG {
+		a = append([]interface{}{ck.id}, a...)
+		log.Printf("[Client \033[32m%v\033[0m] "+format, a...)
+	}
+	return
+}
 
 // which shard is a key in?
 // please use this function,
@@ -119,13 +128,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+				ck.debug("send PutAppend request %v:%v to %v", key, value, servers[si])
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					ck.debug("received OK for PutAppend request %v:%v", key, value)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.debug("received ErrWrongGroup for PutAppend request %v:%v", key, value)
 					break
 				}
+				ck.debug("failed PutAppend request %v:%v", key, value)
 				// ... not ok, or ErrWrongLeader
 			}
 		}

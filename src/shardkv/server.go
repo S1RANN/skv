@@ -9,12 +9,13 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"6.5840/shardctrler"
 )
 
-const Debug = true
+const DEBUG = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
+	if DEBUG {
 		log.Printf(format, a...)
 	}
 	return
@@ -28,6 +29,20 @@ const (
 	GET
 	RECONF
 )
+
+func (ot OpType) String() string {
+	switch ot {
+	case PUT:
+		return "PUT"
+	case APPEND:
+		return "APPEND"
+	case GET:
+		return "GET"
+	case RECONF:
+		return "RECONF"
+	}
+	return "UNKNOWN"
+}
 
 type Op struct {
 	// Your definitions here.
@@ -59,13 +74,22 @@ type ShardKV struct {
 	latestResults map[int64]RequestResult
 	rpcWakers     map[int64]*RpcWaker
 	persister     *raft.Persister
+	stages        []ReconfStage
+	ck            *shardctrler.Clerk
+}
+
+type ReconfStage struct {
+	Config        shardctrler.Config
+	DroppedShards map[int]map[string]string
+	LatestResults map[int64]RequestResult
 }
 
 type RpcWaker struct {
-	seq  int // required when crashing, re-applying previous ops
-	term int // without comparing seq may wrongly wake up rpcs
-	done chan string
-	lost chan bool
+	seq         int // required when crashing, re-applying previous ops
+	term        int // without comparing seq may wrongly wake up rpcs
+	done        chan string
+	wrongLeader chan bool
+	wrongGroup  chan bool
 }
 
 type RequestResult struct {
@@ -74,8 +98,34 @@ type RequestResult struct {
 }
 
 func (kv *ShardKV) debug(format string, args ...interface{}) {
-	args = append([]interface{}{kv.me}, args...)
-	DPrintf("KVServer %v "+format, args...)
+	args = append([]interface{}{kv.gid, kv.me, kv.stages[len(kv.stages)-1].Config.Num}, args...)
+	DPrintf("[\033[32m%v\033[0m:\033[33m%v\033[0m|\033[31m%v\033[0m] "+format, args...)
+}
+
+func (kv *ShardKV) checkReconfiguration() {
+	for {
+		kv.mu.Lock()
+		latestConfigNum := kv.stages[len(kv.stages)-1].Config.Num
+		kv.mu.Unlock()
+		conf := kv.ck.Query(latestConfigNum + 1)
+
+		if conf.Num > latestConfigNum {
+			op := Op{
+				ClientId: -1,
+				Seq:      conf.Num,
+				Type:     RECONF,
+				Params:   conf,
+			}
+
+			kv.mu.Lock()
+			kv.debug("detected configuration update %v > %v, start op: %+v", conf.Num, latestConfigNum, op)
+			kv.mu.Unlock()
+
+			kv.rf.Start(op)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (kv *ShardKV) checkLeadership() {
@@ -85,7 +135,7 @@ func (kv *ShardKV) checkLeadership() {
 		kv.mu.Lock()
 		for clientId, waker := range kv.rpcWakers {
 			if waker.term != -1 && currentTerm != waker.term {
-				kv.debug(" waking up %v for leadership lost", clientId)
+				kv.debug("waking up %v for leadership lost", clientId)
 				wakers = append(wakers, kv.rpcWakers[clientId])
 				delete(kv.rpcWakers, clientId)
 			}
@@ -93,7 +143,7 @@ func (kv *ShardKV) checkLeadership() {
 		kv.mu.Unlock()
 
 		for _, waker := range wakers {
-			waker.lost <- true
+			waker.wrongLeader <- true
 		}
 
 		time.Sleep(50 * time.Millisecond)
@@ -102,23 +152,13 @@ func (kv *ShardKV) checkLeadership() {
 
 func (kv *ShardKV) readApplyMsg() {
 	for applyMsg := range kv.applyCh {
-		kv.debug("received applyMsg:%+v", applyMsg)
-
 		if applyMsg.SnapshotValid {
 			kv.readSnapshot(applyMsg.Snapshot)
 			continue
 		}
 
-		kv.mu.Lock()
-		kv.debug("before execute latestResult: %+v", kv.latestResults)
-		kv.mu.Unlock()
-
 		op := applyMsg.Command.(Op)
 		kv.executeOp(op)
-
-		kv.mu.Lock()
-		kv.debug("after execute latestResult: %+v", kv.latestResults)
-		kv.mu.Unlock()
 
 		kv.checkRaftStateSize(applyMsg.CommandIndex)
 	}
@@ -127,40 +167,230 @@ func (kv *ShardKV) readApplyMsg() {
 func (kv *ShardKV) executeOp(op Op) {
 	kv.mu.Lock()
 
+	kv.debug("checking op: %+v", op)
+
 	if result, ok := kv.latestResults[op.ClientId]; ok && op.Seq <= result.Seq {
+		// It's possible that a request arrives before reconfiguration done.
+		// In this case the latestRequest.Seq for that clientId is yet to be updated.
+		// Hence this request will pass the first check.
+		// Here we need to double check this and wake up the rpc if there exists one.
+		kv.debug("op.Seq %v <= result.Seq %v, ignored", op.Seq, result.Seq)
+		if waker, ok := kv.rpcWakers[op.ClientId]; ok && waker.seq == op.Seq {
+			value := kv.latestResults[op.ClientId].Value
+			delete(kv.rpcWakers, op.ClientId)
+			kv.debug("waking up waker for %v:%v with done", op.ClientId, op.Seq)
+			kv.mu.Unlock()
+			waker.done <- value
+			kv.mu.Lock()
+			kv.debug("woke up waker for %v:%v with done", op.ClientId, op.Seq)
+			kv.mu.Unlock()
+			return
+		}
 		kv.mu.Unlock()
 		return
 	}
 
 	kv.debug("executing op: %+v", op)
 
-	value := ""
-	switch op.Type {
-	case PUT:
-		pair := op.Params.(KVPair)
-		kv.db[pair.Key] = pair.Value
-		kv.debug("db: %v", kv.db)
-	case APPEND:
-		pair := op.Params.(KVPair)
-		kv.db[pair.Key] += pair.Value
-		kv.debug("db: %v", kv.db)
-	case GET:
-		key := op.Params.(string)
-		value = kv.db[key]
-	}
+	if op.Type == RECONF {
+		oldStage := kv.stages[len(kv.stages)-1]
+		newConfig := op.Params.(shardctrler.Config)
 
-	kv.latestResults[op.ClientId] = RequestResult{op.Seq, value}
-	kv.debug("updated latestResult for %v to %+v", op.ClientId, kv.latestResults[op.ClientId])
+		oldShards, newShards := map[int]bool{}, map[int]bool{}
+		newlyOwnedShards := map[int]bool{}
+		droppedShards := map[int]map[string]string{}
 
-	if waker, ok := kv.rpcWakers[op.ClientId]; ok && waker.seq == op.Seq {
-		delete(kv.rpcWakers, op.ClientId)
+		for shardId, groupId := range oldStage.Config.Shards {
+			if groupId == kv.gid {
+				oldShards[shardId] = true
+			}
+		}
+		for shardId, groupId := range newConfig.Shards {
+			if groupId == kv.gid {
+				newShards[shardId] = true
+			}
+		}
+
+		for shardId := range newShards {
+			if _, ok := oldShards[shardId]; !ok {
+				newlyOwnedShards[shardId] = true
+			}
+		}
+
+		for shardId := range oldShards {
+			if _, ok := newShards[shardId]; !ok {
+				droppedShards[shardId] = map[string]string{}
+			}
+		}
+
+		for k, v := range kv.db {
+			shardId := key2shard(k)
+			if shards, ok := droppedShards[shardId]; ok {
+				delete(kv.db, k)
+				shards[k] = v
+			}
+		}
+
+		newStage := ReconfStage{
+			Config:        newConfig,
+			DroppedShards: droppedShards,
+			LatestResults: map[int64]RequestResult{},
+		}
+
+		newStage.Config.Groups = map[int][]string{}
+
+		for groupId, shards := range newConfig.Groups {
+			s := make([]string, len(shards))
+			copy(s, shards)
+			newStage.Config.Groups[groupId] = s
+		}
+
+		for k, v := range kv.latestResults {
+			newStage.LatestResults[k] = v
+		}
+
+		kv.stages = append(kv.stages, newStage)
+
+		kv.debug("updated config to %v", newConfig.Num)
+		kv.debug("now has stages: %+v", kv.stages)
+		kv.debug("now owns extra shards: %v, no longer owns shards: %v", newlyOwnedShards, droppedShards)
+		kv.debug("starts waiting for shard migration")
+
 		kv.mu.Unlock()
-		kv.debug("waking up rpc for %v:%v", op.ClientId, op.Seq)
-		waker.done <- value
-		kv.debug("woke up rpc for %v:%v", op.ClientId, op.Seq)
-		return
+
+		shardsToMigrateIn := []int{}
+
+		for shardId := range newlyOwnedShards {
+			groupIdToAsk := oldStage.Config.Shards[shardId]
+			if groupIdToAsk != 0 {
+				shardsToMigrateIn = append(shardsToMigrateIn, shardId)
+			}
+		}
+
+		wg := &sync.WaitGroup{}
+		wg.Add(len(shardsToMigrateIn))
+
+		for _, shardId := range shardsToMigrateIn {
+			groupIdToAsk := oldStage.Config.Shards[shardId]
+			groupNamesToAsk := oldStage.Config.Groups[groupIdToAsk]
+
+			ends := []*labrpc.ClientEnd{}
+
+			for _, groupName := range groupNamesToAsk {
+				ends = append(ends, kv.make_end(groupName))
+			}
+
+			args := &MigrateArgs{shardId, newConfig.Num}
+
+			kv.mu.Lock()
+			kv.debug("launching Migrate requests for shard %v to group %v", shardId, groupIdToAsk)
+			kv.mu.Unlock()
+
+			go func() {
+				defer wg.Done()
+
+				for {
+					for _, end := range ends {
+						reply := &MigrateReply{}
+						ok := kv.sendMigrate(end, args, reply)
+						if ok && reply.Err == OK {
+							kv.mu.Lock()
+							kv.debug("received shard %v", args.ShardId)
+
+							oldLatestResults := map[int64]RequestResult{}
+
+							for k, v := range kv.latestResults {
+								oldLatestResults[k] = v
+							}
+
+							for k, v := range reply.Pairs {
+								kv.db[k] = v
+							}
+							for clientId, incomingResult := range reply.LatestResults {
+								if clientId == -1 {
+									continue
+								}
+								if myResult, ok := kv.latestResults[clientId]; ok {
+									if myResult.Seq < incomingResult.Seq {
+										kv.latestResults[clientId] = incomingResult
+									}
+								} else {
+									kv.latestResults[clientId] = incomingResult
+								}
+							}
+
+							kv.debug("oldLatestResult: %v", oldLatestResults)
+							kv.debug("latestResult: %v", kv.latestResults)
+
+							kv.mu.Unlock()
+							return
+						}
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		kv.mu.Lock()
+		kv.debug("completed shard migration")
+		kv.latestResults[op.ClientId] = RequestResult{op.Seq, ""}
+		kv.debug("updated latestResult for %v to %+v", op.ClientId, kv.latestResults[op.ClientId])
+		kv.mu.Unlock()
+	} else {
+		key := ""
+		if op.Type == PUT || op.Type == APPEND {
+			key = op.Params.(KVPair).Key
+		} else {
+			key = op.Params.(string)
+		}
+
+		shardId := key2shard(key)
+		if kv.stages[len(kv.stages)-1].Config.Shards[shardId] != kv.gid {
+			kv.debug("does not own shard %v for %v, ignored op", shardId, key)
+			if waker, ok := kv.rpcWakers[op.ClientId]; ok && waker.seq == op.Seq {
+				delete(kv.rpcWakers, op.ClientId)
+				kv.debug("waking up waker for %v:%v with wrongGroup", op.ClientId, op.Seq)
+				kv.mu.Unlock()
+				waker.wrongGroup <- true
+				kv.mu.Lock()
+				kv.debug("woke up waker for %v:%v with wrongGroup", op.ClientId, op.Seq)
+				kv.mu.Unlock()
+				return
+			}
+			kv.mu.Unlock()
+			return
+		}
+
+		value := ""
+		switch op.Type {
+		case PUT:
+			pair := op.Params.(KVPair)
+			kv.db[pair.Key] = pair.Value
+		case APPEND:
+			pair := op.Params.(KVPair)
+			kv.db[pair.Key] += pair.Value
+		case GET:
+			key := op.Params.(string)
+			value = kv.db[key]
+		}
+
+		kv.latestResults[op.ClientId] = RequestResult{op.Seq, value}
+		kv.debug("updated latestResult for %v to %+v", op.ClientId, kv.latestResults[op.ClientId])
+
+		if waker, ok := kv.rpcWakers[op.ClientId]; ok && waker.seq == op.Seq {
+			delete(kv.rpcWakers, op.ClientId)
+			kv.debug("waking up waker for %v:%v with done", op.ClientId, op.Seq)
+			kv.mu.Unlock()
+			waker.done <- value
+			kv.mu.Lock()
+			kv.debug("woke up waker for %v:%v with done", op.ClientId, op.Seq)
+			kv.mu.Unlock()
+			return
+		}
+		kv.mu.Unlock()
 	}
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -172,10 +402,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		// for this request must have been obselete, client only
 		// send new request once it receives correct response
 		// kv.info("result: %+v, args :%+v", result, args)
+		kv.debug("reply to %+v with latest value %v", args, result.Value)
 		kv.mu.Unlock()
 		reply.Err = OK
 		reply.Value = result.Value
-		kv.debug("reply to %+v with latest value %v", args, result.Value)
 		return
 	}
 
@@ -185,7 +415,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// initialize term to -1, suggesting waiting is not started
 
 	done := make(chan string, 1)
-	lost := make(chan bool, 1)
+	wrongLeader := make(chan bool, 1)
+	wrongGroup := make(chan bool, 1)
 
 	// A new request arriving means client won't care about older replies
 	// So just wake previous rpcs regardless of their replies
@@ -193,13 +424,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// signal. Also we are holding the lock so it is safe to write to
 	// the channel
 	oldWaker := kv.rpcWakers[args.ClientId]
-	kv.rpcWakers[args.ClientId] = &RpcWaker{args.Seq, -1, done, lost}
-	kv.mu.Unlock()
+	kv.rpcWakers[args.ClientId] = &RpcWaker{args.Seq, -1, done, wrongLeader, wrongGroup}
 
 	if oldWaker != nil {
-		kv.debug("waking up the old rpc for %v:%v", args.ClientId, oldWaker.seq)
 		oldWaker.done <- ""
-		kv.debug("woke up the old rpc %v:%v", args.ClientId, oldWaker.seq)
 	}
 
 	op := Op{
@@ -210,16 +438,20 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.debug("start op: %+v for %+v", op, args)
+	kv.mu.Unlock()
+
 	_, term, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
 		kv.debug("is not leader for %+v", args)
+		kv.mu.Unlock()
 		return
 	}
 
-	kv.debug("start waiting for %+v", args)
 	kv.mu.Lock()
+	kv.debug("start waiting for %+v", args)
 	// if op has not already been executed and delete the waker, change
 	// the term of the waker
 	if waker, ok := kv.rpcWakers[args.ClientId]; ok {
@@ -230,11 +462,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case reply.Value = <-done:
 		reply.Err = OK
-	case <-lost:
+	case <-wrongLeader:
 		reply.Err = ErrWrongLeader
+	case <-wrongGroup:
+		reply.Err = ErrWrongGroup
 	}
 
+	kv.mu.Lock()
 	kv.debug("reply to %+v with %+v", args, reply)
+	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -250,9 +486,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// It's ok to return latest value to request with smaller seq
 		// for this request must have been obselete, client only
 		// send new request once it receives correct response
+		kv.debug("reply to %+v with OK", args)
 		kv.mu.Unlock()
 		reply.Err = OK
-		kv.debug("reply to %+v with OK", args)
 		return
 	}
 
@@ -262,7 +498,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// initialize term to -1, suggesting waiting is not started
 
 	done := make(chan string, 1)
-	lost := make(chan bool, 1)
+	wrongLeader := make(chan bool, 1)
+	wrongGroup := make(chan bool, 1)
 
 	// A new request arriving means client won't care about older replies
 	// So just wake previous rpcs regardless of their replies
@@ -270,13 +507,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// signal. Also we are holding the lock so it is safe to write to
 	// the channel
 	oldWaker := kv.rpcWakers[args.ClientId]
-	kv.rpcWakers[args.ClientId] = &RpcWaker{args.Seq, -1, done, lost}
-	kv.mu.Unlock()
+	kv.rpcWakers[args.ClientId] = &RpcWaker{args.Seq, -1, done, wrongLeader, wrongGroup}
 
 	if oldWaker != nil {
-		kv.debug("waking up the old rpc")
 		oldWaker.done <- ""
-		kv.debug("woke up the old rpc")
 	}
 
 	op := Op{
@@ -287,17 +521,20 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.debug("start op: %+v for %+v", op, args)
+	kv.mu.Unlock()
+
 	_, term, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
 		kv.debug("is not leader for %+v", args)
+		kv.mu.Unlock()
 		return
 	}
 
-	kv.debug("start waiting for %+v", args)
-
 	kv.mu.Lock()
+	kv.debug("start waiting for %+v", args)
 	// if op has not already been executed and delete the waker, change
 	// the term of the waker
 	if waker, ok := kv.rpcWakers[args.ClientId]; ok {
@@ -308,10 +545,40 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case <-done:
 		reply.Err = OK
-	case <-lost:
+	case <-wrongLeader:
 		reply.Err = ErrWrongLeader
+	case <-wrongGroup:
+		reply.Err = ErrWrongGroup
 	}
+	kv.mu.Lock()
 	kv.debug("reply to %+v with %+v", args, reply)
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) sendMigrate(end *labrpc.ClientEnd, args *MigrateArgs, reply *MigrateReply) bool {
+	return end.Call("ShardKV.Migrate", args, reply)
+}
+
+func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	kv.debug("received MIGRATE request %v:%v", args.ConfigNum, args.ShardId)
+
+	for _, stage := range kv.stages {
+		if stage.Config.Num == args.ConfigNum {
+			if shards, ok := stage.DroppedShards[args.ShardId]; ok {
+				reply.Err = OK
+				reply.Pairs = shards
+				reply.LatestResults = stage.LatestResults
+				kv.debug("reply to MIGRATE request %v:%v with %+v", args.ConfigNum, args.ShardId, reply)
+				return
+			}
+		}
+	}
+
+	kv.debug("does not have shard %v in dropped shards in config %v", args.ShardId, args.ConfigNum)
+	reply.Err = ErrWrongLeader
 }
 
 func (kv *ShardKV) checkRaftStateSize(index int) {
@@ -323,6 +590,7 @@ func (kv *ShardKV) checkRaftStateSize(index int) {
 		kv.mu.Lock()
 		e.Encode(kv.db)
 		e.Encode(kv.latestResults)
+		e.Encode(kv.stages)
 		kv.mu.Unlock()
 
 		snapshot := w.Bytes()
@@ -340,14 +608,19 @@ func (kv *ShardKV) readSnapshot(snapshot []byte) {
 
 	var db map[string]string
 	var latestResults map[int64]RequestResult
+	var stages []ReconfStage
 
-	if d.Decode(&db) != nil || d.Decode(&latestResults) != nil {
+	if d.Decode(&db) != nil || d.Decode(&latestResults) != nil || d.Decode(&stages) != nil {
+		kv.mu.Lock()
 		kv.debug("failed to read snapshot")
+		kv.mu.Unlock()
 	}
 
 	kv.mu.Lock()
 	kv.db = db
 	kv.latestResults = latestResults
+	kv.stages = stages
+	kv.debug("done read snapshot")
 	kv.mu.Unlock()
 }
 
@@ -393,6 +666,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(make(map[string]string))
 	labgob.Register(make(map[int64]RequestResult))
 	labgob.Register(KVPair{})
+	labgob.Register(shardctrler.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -400,6 +674,15 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
+	kv.stages = []ReconfStage{{
+		Config: shardctrler.Config{
+			Num:    0,
+			Shards: [10]int{},
+			Groups: nil,
+		},
+		DroppedShards: nil,
+	}}
+	kv.ck = shardctrler.MakeClerk(ctrlers)
 
 	// Your initialization code here.
 	kv.db = make(map[string]string)
@@ -417,6 +700,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.readApplyMsg()
 	go kv.checkLeadership()
+	go kv.checkReconfiguration()
 
 	return kv
 }

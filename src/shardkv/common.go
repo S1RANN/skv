@@ -53,6 +53,7 @@ type MigrateArgs struct {
 }
 
 type MigrateReply struct {
-	Pairs map[string]string
-	Err   Err
+	Pairs         map[string]string
+	LatestResults map[int64]RequestResult
+	Err           Err
 }
